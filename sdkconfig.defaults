@@ -1,0 +1,37 @@
+# FoloToy AI Passport game firmware: ESP32-C3, 8 MB flash, no PSRAM.
+CONFIG_IDF_TARGET="esp32c3"
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+
+# Native USB Serial/JTAG console; GPIO21 is the backlight, not UART0.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# A game needs no radio: leave Wi-Fi and Bluetooth out entirely.
+CONFIG_BT_ENABLED=n
+CONFIG_ESP_WIFI_ENABLED=n
+
+# The game shares the board with the assistant: the same partition table
+# (the game goes in ota_1), the same bootloader with rollback, and apps signed
+# with the same key, which the assistant checks before it boots the game.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x10000
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+# dev_signing_key.pem is the assistant's shared dev key, not a secret.
+CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT=y
+CONFIG_SECURE_SIGNED_APPS_RSA_SCHEME=y
+CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT=y
+CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES=y
+CONFIG_SECURE_BOOT_SIGNING_KEY="dev_signing_key.pem"
+
+# 1 ms ticks for a smooth frame pace.
+CONFIG_FREERTOS_HZ=1000
+
+# Performance for the render loop.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
+
+# No PSRAM on this board.
+CONFIG_SPIRAM=n

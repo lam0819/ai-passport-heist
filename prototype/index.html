@@ -1,0 +1,1048 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>午夜神偷 Midnight Heist — AI Passport prototype</title>
+<style>
+  html,body{margin:0;background:#121214;color:#ddd;touch-action:none;user-select:none;-webkit-user-select:none;
+    font-family:-apple-system,"PingFang HK","PingFang TC","Noto Sans CJK TC","Microsoft JhengHei",sans-serif}
+  #wrap{display:flex;flex-direction:column;align-items:center;gap:12px;padding:12px}
+  #device{background:#26262b;border-radius:22px;padding:16px;box-shadow:0 0 0 2px #3a3a40,0 10px 30px #0008}
+  canvas{display:block;width:min(94vw,960px,calc((100vh - 190px)*4/3));aspect-ratio:4/3;background:#000;image-rendering:pixelated}
+  #keys{display:flex;gap:14px}
+  #keys button{width:96px;height:60px;border-radius:14px;border:none;background:#45454d;color:#fff;font-size:16px;font-weight:600;touch-action:none}
+  #keys button.on{background:#c8352f}
+  #help{font-size:13px;max-width:900px;opacity:.75;text-align:center;line-height:1.5}
+  kbd{background:#333;border-radius:4px;padding:1px 5px}
+  #out{white-space:pre;font:12px monospace;color:#9f9}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="device"><canvas id="c" width="960" height="720"></canvas></div>
+  <div id="keys">
+    <button data-k="up">UP ◀</button>
+    <button data-k="ok">OK</button>
+    <button data-k="down">DOWN ▶</button>
+  </div>
+  <div id="help">
+    <kbd>↑</kbd>/<kbd>W</kbd> = UP（向左） · <kbd>↓</kbd>/<kbd>S</kbd> = DOWN（向右） · <kbd>Space</kbd>/<kbd>Enter</kbd> = OK<br>
+    企定短按 OK：電擊槍（只係整暈警衛）/ 開關門（門後有人就撞暈佢）/ 上落樓梯 / 天台逃走 · 喺柱位凹位撳住 OK：匿埋<br>
+    跳：行緊（或啱啱放手仲滑緊）撳 OK 即刻跳，撳耐啲跳高啲，跑快啲跳遠啲 · 企定撳住 OK 0.18 秒都會跳 · 彈床 b：彈上一層<br>
+    向牆（或關咗嘅門）一直行 1.5 秒：暫停（同機上一樣；瀏覽器 UP+DOWN 一齊撳都得）<br>
+    Prototype of an original stealth-heist homage for AI Passport · 320×240 logical screen scaled ×3
+  </div>
+  <div id="out"></div>
+</div>
+<script src="levels.js"></script>
+<script>
+'use strict';
+// ---------------------------------------------------------------------------
+// Screen: the Passport panel in landscape, 320x240, drawn in logical pixels
+// and scaled x3. Layout: HUD 22 px, roof band 26 px (sky, getaway balloon,
+// hints), then 64 px floors. The building scrolls sideways; a 4-floor building
+// also glides up and down to keep the thief's floor in view.
+// ---------------------------------------------------------------------------
+const SW = 320, SH = 240, S = 3, T = 16, HUD_H = 22, ROOF_H = 26, FH = 64;
+let Y0 = HUD_H + ROOF_H;              // top of the building; lower for 2-floor levels, so the ground floor stays at the bottom
+const PW = 12;                           // player / guard body width
+const cv = document.getElementById('c');
+const g = cv.getContext('2d');
+g.imageSmoothingEnabled = false;
+const FONT = '"PingFang HK","PingFang TC","Noto Sans CJK TC","Microsoft JhengHei",sans-serif';
+
+// --- all tunables (would be main/config.h on the device) --------------------
+const C = {
+  WALK: 70, ACCEL: 420, FRICTION: 620, TAP_S: 0.18, PAUSE_PUSH_S: 1.5,
+  GUN_V: 220, GUN_RANGE: 130, GUN_CD: 0.6, STUN_S: 5, SLAM_STUN_S: 7, DOG_STUN_S: 3,
+  GUARD_SPEED: 24, ALERT_SPEED: 46, DOG_SPEED: 38, DOG_CHARGE: 92, PATROL_COLS: 5, PATROL_WAIT: 1.2,
+  VISION: 100, DOG_VISION: 84, SPOT_S: 0.45, LOSE_S: 3, SHOT_WINDUP: 0.5, SHOT_CD: 1.5, SHOT_V: 120, KEEP_DIST: 56,
+  JUMP_V: 120, JUMP_RUN: 0, GRAVITY: 520, HOLD_GRAV: 220, JUMP_HOLD_S: 0.25, CEIL: 21, DART_H: 12, AIR_ACCEL: 260, MOVE_V: 20, RUN_GRACE_S: 0.15,
+  CRATE_H: 14, SPRING_V: 280, SLIP_S: 0.7, NOISE_SLIP: 110,
+  NOISE_CAN: 110, NOISE_GUN: 56, NOISE_SLAM: 90, SLEEP_NEAR: 22, SLEEP_WAKE_S: 1.2,
+  KNOCK_S: 1.1, INVULN_S: 2.2, LIVES: 3,   // timers are per level (levels.js time)
+  SCORE_STUN: 100, SCORE_SLAM: 300, SCORE_TIME: 20, SCORE_GHOST: 3000, SCORE_BAR: 300, SCORE_ALLBARS: 5000,
+};
+
+// --- levels: tools/gen_levels.py writes levels.js (the same maps as main/levels.c,
+// checked for reachability, solvability, timers and the difficulty curve).
+// Played strictly in order; a bonus stage follows every third level.
+// .  corridor  S start  E roof exit  H alcove  | door  $ loot  ^/v stairs  g guard
+// G shield guard  z sleeper  d dog  c can  x crate  p banana  b springboard -> o hatch
+
+// --- level build + validation ----------------------------------------------
+let lv = null;
+function build(L) {
+  const nF = L.floors.length, W = L.floors[0].length;
+  const o = { L, nF, W, doors: [], stairs: [], hides: [], loot: [], guards: [], cans: [], exit: null, start: null, lights: [], crates: [], peels: [], springs: [], hatches: [] };
+  let li = 0;
+  L.floors.forEach((row, f) => {
+    if (row.length !== W) throw new Error(`${L.name}: floor ${f} is ${row.length} wide, want ${W}`);
+    [...row].forEach((ch, col) => {
+      const x = col * T;
+      switch (ch) {
+        case '.': break;
+        case 'S': if (f !== nF - 1) throw new Error(`${L.name}: start must be on the ground floor`); o.start = { x: x + 2, f }; break;
+        case 'E': if (f !== 0) throw new Error(`${L.name}: exit must be on the top floor`); o.exit = { col, f }; break;
+        case 'H': o.hides.push({ col, f }); break;
+        case '|': o.doors.push({ col, f, open: false, side: 1, anim: 0 }); break;
+        case '$': {
+          if (L.bonus) { o.loot.push({ x: x + 3, f, kind: 'bar', value: C.SCORE_BAR, state: 'floor', home: { x: x + 3, f } }); break; }
+          const d = L.loot[li++];
+          if (!d) throw new Error(`${L.name}: more $ than loot entries`);
+          o.loot.push({ x: x + 3, f, kind: d[0], value: d[1], state: 'floor', home: { x: x + 3, f } }); break;
+        }
+        case '^': case 'v': o.stairs.push({ col, f, dir: ch === '^' ? -1 : 1 }); break;
+        case 'g': case 'G': case 'z': case 'd': o.guards.push(makeGuard(ch, x + 2, f)); break;
+        case 'c': o.cans.push({ x: x + 6, f, cd: 0, vx: 0 }); break;
+        case 'x': o.crates.push({ col, f }); break;
+        case 'p': o.peels.push({ x: x + 8, f, cd: 0 }); break;
+        case 'b': o.springs.push({ col, f, anim: 0 }); break;
+        case 'o': o.hatches.push({ col, f }); break;
+        default: throw new Error(`${L.name}: unknown tile '${ch}' at floor ${f} col ${col}`);
+      }
+    });
+  });
+  if (!o.start) throw new Error(`${L.name}: no start`);
+  if (!L.bonus && !o.exit) throw new Error(`${L.name}: no exit`);
+  if (!L.bonus && li !== L.loot.length) throw new Error(`${L.name}: ${L.loot.length} loot entries but ${li} $ tiles`);
+  for (const s of o.stairs) {
+    const to = s.f + s.dir;
+    if (!o.stairs.some(t => t.f === to && t.col === s.col && t.dir === -s.dir))
+      throw new Error(`${L.name}: stairs at col ${s.col} floor ${s.f} lead nowhere`);
+  }
+  for (const b of o.springs)
+    if (b.f === 0 || !o.hatches.some(h => h.f === b.f - 1 && h.col === b.col)) throw new Error(`${L.name}: springboard at col ${b.col} floor ${b.f} has no hatch above`);
+  for (const h of o.hatches)
+    if (!o.springs.some(b => b.f === h.f + 1 && b.col === h.col)) throw new Error(`${L.name}: hatch at col ${h.col} floor ${h.f} has no springboard below`);
+  for (const c of o.crates)
+    if ([...o.stairs, ...o.doors, ...o.hides, ...o.springs].some(t => t.f === c.f && Math.abs(t.col - c.col) < 2)) throw new Error(`${L.name}: crate at col ${c.col} floor ${c.f} too close to stairs/door/alcove/spring`);
+  // every loot and the exit must be reachable from the start with doors opened
+  const seen = new Set([`${o.start.f}`]);
+  const q = [o.start.f];
+  while (q.length) { const f = q.pop(); for (const s of [...o.stairs, ...o.springs.map(b => ({ f: b.f, dir: -1 }))]) if (s.f === f && !seen.has(`${s.f + s.dir}`)) { seen.add(`${s.f + s.dir}`); q.push(s.f + s.dir); } }
+  for (const it of o.loot) if (!seen.has(`${it.f}`)) throw new Error(`${L.name}: loot on floor ${it.f} unreachable`);
+  if (L.bonus) for (const [f, w, sp] of L.lights) o.lights.push({ f, w, sp, x: 40 + f * 90, dir: f % 2 ? -1 : 1 });
+  return o;
+}
+function makeGuard(type, x, f) {
+  return { type, x, f, home: x, vx: 0, face: type === 'd' ? -1 : 1, state: type === 'z' ? 'sleep' : 'patrol', t: 0,
+    stun: 0, spot: 0, shotCd: 0, windup: 0, tx: x, lostT: 0, nearT: 0, walkT: 0, wait: 0, bubble: '' };
+}
+const feetY = f => Y0 + f * FH + 58;
+// Screen y of the top floor's ceiling that shows floor f (main/world.c world_view_y0).
+function viewY0(f) {
+  const bottom = SH - lv.nF * FH;
+  if (bottom >= HUD_H + 26) return bottom;
+  return Math.max(bottom, SH - 3 * FH - Math.max(0, f - 2) * FH);
+}
+const doorX = d => d.col * T + 8;
+const center = e => e.x + PW / 2;
+const levelW = () => lv.W * T;
+
+// Walls: level ends, closed doors and (for anyone below their top) crates.
+// Returns [min x, max x] for a body at x, y px above the floor.
+function limits(f, x, y = 0) {
+  let lo = 2, hi = levelW() - PW - 2;
+  const c = x + PW / 2;
+  for (const d of lv.doors) {
+    if (d.f !== f || d.open) continue;
+    const dx = doorX(d);
+    if (dx <= c) lo = Math.max(lo, dx + 3); else hi = Math.min(hi, dx - 3 - PW);
+  }
+  if (y < C.CRATE_H - 1) for (const k of lv.crates) {
+    if (k.f !== f) continue;
+    const a = k.col * T + 1, b = k.col * T + T - 1;
+    if (b <= c) lo = Math.max(lo, b); else if (a >= c) hi = Math.min(hi, a - PW);
+  }
+  return [lo, hi];
+}
+// Height of whatever the body at x stands on: a crate top or the floor.
+function support(f, x) {
+  for (const k of lv.crates) if (k.f === f && x + PW > k.col * T + 2 && x < k.col * T + T - 2) return C.CRATE_H;
+  return 0;
+}
+function closedDoorBetween(f, a, b) {
+  const lo = Math.min(a, b), hi = Math.max(a, b);
+  return lv.doors.some(d => d.f === f && !d.open && doorX(d) > lo && doorX(d) < hi);
+}
+
+// --- audio (WebAudio; the device would use the ES8311 synth) ----------------
+let AC = null, master = null, soundOn = true, musicNext = 0, musicStep = 0;
+function audioInit() {
+  if (AC) { if (AC.state === 'suspended') AC.resume(); return; }
+  try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return; }
+  master = AC.createGain(); master.gain.value = 0.5; master.connect(AC.destination);
+  const buf = AC.createBuffer(1, AC.sampleRate, AC.sampleRate), d = buf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  AC.noise = buf;
+}
+function beep(freq, dur, type = 'square', vol = 0.06, to = 0, delay = 0, at = 0) {
+  if (!AC || !soundOn) return;
+  const t0 = (at || AC.currentTime) + delay, o = AC.createOscillator(), gn = AC.createGain();
+  o.type = type; o.frequency.setValueAtTime(freq, t0);
+  if (to) o.frequency.exponentialRampToValueAtTime(to, t0 + dur);
+  gn.gain.setValueAtTime(vol, t0); gn.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  o.connect(gn); gn.connect(master); o.start(t0); o.stop(t0 + dur + 0.02);
+}
+function noiseSfx(dur, vol = 0.08, freq = 3000, type = 'highpass') {
+  if (!AC || !soundOn) return;
+  const t0 = AC.currentTime, s = AC.createBufferSource(), f = AC.createBiquadFilter(), gn = AC.createGain();
+  s.buffer = AC.noise; f.type = type; f.frequency.value = freq;
+  gn.gain.setValueAtTime(vol, t0); gn.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  s.connect(f); f.connect(gn); gn.connect(master); s.start(t0, Math.random() * 0.5); s.stop(t0 + dur + 0.02);
+}
+const SFX = {
+  move: () => beep(660, 0.05),
+  select: () => { beep(880, 0.06); beep(1320, 0.08, 'square', 0.06, 0, 0.06); },
+  zap: () => { beep(1400, 0.08, 'square', 0.04, 2400); noiseSfx(0.05, 0.04, 6000); },
+  jump: () => beep(392, 0.12, 'square', 0.05, 784),
+  boing: () => { beep(180, 0.25, 'triangle', 0.1, 720); beep(240, 0.2, 'square', 0.03, 960, 0.05); },
+  slip: () => { beep(900, 0.3, 'triangle', 0.07, 200); noiseSfx(0.2, 0.05, 2000); },
+  land: () => beep(140, 0.05, 'triangle', 0.06),
+  slam: () => { beep(110, 0.18, 'triangle', 0.14, 50); noiseSfx(0.1, 0.08, 400, 'lowpass'); },
+  door: () => beep(220, 0.12, 'triangle', 0.06, 330),
+  clatter: () => { for (let i = 0; i < 4; i++) beep(1200 + i * 300, 0.04, 'square', 0.03, 0, i * 0.05); },
+  alert: () => { beep(988, 0.1, 'square', 0.06); beep(1319, 0.14, 'square', 0.06, 0, 0.1); },
+  shot: () => beep(900, 0.1, 'sawtooth', 0.04, 300),
+  block: () => beep(2000, 0.05, 'square', 0.04),
+  hit: () => { beep(200, 0.25, 'sawtooth', 0.07, 60); noiseSfx(0.15, 0.06, 800, 'lowpass'); },
+  pick: () => { beep(784, 0.06); beep(1175, 0.1, 'square', 0.06, 0, 0.06); },
+  drop: () => beep(300, 0.12, 'triangle', 0.08, 150),
+  stairs: () => beep(330, 0.14, 'triangle', 0.08, 520),
+  locked: () => beep(160, 0.12, 'square', 0.05),
+  tick: () => beep(1500, 0.03, 'square', 0.03),
+  escape: () => [523, 659, 784, 1047, 784, 1047].forEach((f, i) => beep(f, 0.14, 'square', 0.06, 0, i * 0.11)),
+  lose: () => [392, 330, 262, 196].forEach((f, i) => beep(f, 0.25, 'triangle', 0.09, 0, i * 0.2)),
+};
+// A sneaky walking bass + offbeat pluck; tempo rises when a guard is alerted or time is short.
+const BASS = [45, 0, 48, 0, 50, 0, 51, 50, 45, 0, 48, 0, 43, 0, 44, 0];
+function music() {
+  if (!AC || !soundOn || state !== 'play') { musicNext = 0; return; }
+  const bpm = (anyAlert() || timeLeft < 30) ? 168 : 128, step = 60 / bpm / 2;
+  if (!musicNext || musicNext < AC.currentTime) musicNext = AC.currentTime + 0.05;
+  while (musicNext < AC.currentTime + 0.2) {
+    const n = BASS[musicStep % 16];
+    if (n) beep(440 * Math.pow(2, (n - 69) / 12) * 2, step * 0.8, 'triangle', 0.07, 0, 0, musicNext);
+    if (musicStep % 4 === 2) beep(440 * Math.pow(2, (n + 19 - 69) / 12) * 2 || 880, 0.04, 'square', 0.025, 0, 0, musicNext);
+    musicNext += step; musicStep++;
+  }
+}
+
+// --- input: three keys, like the Passport ADC ladder ------------------------
+const keys = { up: false, down: false, ok: false };
+const KEYMAP = { ArrowUp: 'up', w: 'up', W: 'up', ArrowDown: 'down', s: 'down', S: 'down', ' ': 'ok', Enter: 'ok' };
+const btns = {};
+document.querySelectorAll('#keys button').forEach(b => { btns[b.dataset.k] = b; });
+function setKey(k, on) {
+  if (keys[k] === on) return;
+  keys[k] = on;
+  if (btns[k]) btns[k].classList.toggle('on', on);
+  audioInit();
+  if (on) onPress(k); else onRelease(k);
+}
+addEventListener('keydown', e => { const k = KEYMAP[e.key]; if (!k) return; e.preventDefault(); if (!e.repeat) setKey(k, true); });
+addEventListener('keyup', e => { const k = KEYMAP[e.key]; if (!k) return; e.preventDefault(); setKey(k, false); });
+addEventListener('blur', () => { for (const k in keys) setKey(k, false); });
+for (const k in btns) {
+  const b = btns[k];
+  b.addEventListener('pointerdown', e => { e.preventDefault(); b.setPointerCapture(e.pointerId); setKey(k, true); });
+  for (const ev of ['pointerup', 'pointercancel', 'lostpointercapture']) b.addEventListener(ev, () => setKey(k, false));
+  b.addEventListener('contextmenu', e => e.preventDefault());
+}
+
+// --- game state ---------------------------------------------------------------
+let state = 'title', stateT = 0, time = 0;
+let menuSel = 0, pauseSel = 0, levelIdx = 0, lives = C.LIVES, totalScore = 0, score = 0, timeLeft = 0;
+let okLatch = false, okActive = false, okT = 0, okUsed = false;
+let p = null, cam = 0, shots = [], bolts = [], fx = [], fade = 0, loseReason = '', result = null, everSpotted = false, escapeT = 0;
+let hiscore = +(localStorage.getItem('heist.hiscore') || 0);
+// Progress (the device keeps the same in NVS 'heist'): the highest unlocked level and best stars per level.
+let prog = loadProgress(), resetArmed = false, popupText = '', popupT = 0;
+function loadProgress() {
+  try {
+    const o = JSON.parse(localStorage.getItem('heist.progress') || 'null');
+    if (o && Number.isInteger(o.unlocked) && Array.isArray(o.stars))
+      return { unlocked: Math.min(o.unlocked, LEVELS.length - 1), stars: LEVELS.map((_, i) => Math.min(3, o.stars[i] | 0)) };
+  } catch (e) { /* fall through */ }
+  return { unlocked: 0, stars: LEVELS.map(() => 0) };
+}
+function saveProgress() { localStorage.setItem('heist.progress', JSON.stringify(prog)); }
+function levelDone(stars) {   // finishing a level (any bonus result counts) opens the next one
+  prog.stars[levelIdx] = Math.max(prog.stars[levelIdx], stars);
+  if (levelIdx === prog.unlocked && prog.unlocked + 1 < LEVELS.length) prog.unlocked++;
+  saveProgress();
+}
+function titleItems() {
+  return [...LEVELS.map((L, i) => ({ kind: 'level', i })), { kind: 'sound' }, { kind: 'reset' }];
+}
+
+function setState(s) { state = s; stateT = 0; okLatch = keys.ok; okActive = false; }
+function toTitle() { menuSel = prog.unlocked; resetArmed = false; setState('title'); }   // the cursor waits on the next level
+
+function startLevel(i, keepScore = true) {
+  levelIdx = i; lv = build(LEVELS[i]);
+  Y0 = viewY0(lv.nF - 1);
+  p = { x: lv.start.x, f: lv.start.f, vx: 0, y: 0, vy: 0, air: false, jhold: 0, runT: 9, runV: 0, slip: 0, spring: false, thru: false,
+    face: 1, hidden: false, gunCd: 0, carry: [], inv: 0, knock: 0, walkT: 0, push: 0, muzzle: 0 };
+  shots = []; bolts = []; fx = []; fade = 0; cam = 0; score = 0; everSpotted = false; escapeT = 0;
+  timeLeft = lv.L.time;
+  if (!keepScore) { totalScore = 0; lives = C.LIVES; }
+  setState('intro');
+}
+
+function onPress(k) {
+  if ((k === 'up' && keys.down) || (k === 'down' && keys.up)) { chord(); return; }
+  if (state === 'title') {
+    const items = titleItems(), n = items.length;
+    if (k === 'up') { menuSel = (menuSel + n - 1) % n; resetArmed = false; SFX.move(); }
+    else if (k === 'down') { menuSel = (menuSel + 1) % n; resetArmed = false; SFX.move(); }
+    else if (k === 'ok') {
+      const it = items[menuSel];
+      if (it.kind === 'level') {
+        if (it.i > prog.unlocked) { SFX.locked(); popupText = `未解鎖：先過咗 ${LEVELS[it.i - 1].name}`; popupT = 2; }
+        else { SFX.select(); startLevel(it.i, false); }
+      } else if (it.kind === 'sound') { soundOn = !soundOn; SFX.select(); }
+      else if (!resetArmed) { resetArmed = true; SFX.move(); }   // one stray OK must not wipe the stars
+      else { resetArmed = false; prog = { unlocked: 0, stars: LEVELS.map(() => 0) }; saveProgress(); menuSel = 0; popupText = '進度已重設：由 1-1 開始'; popupT = 2; SFX.select(); }
+    }
+  } else if (state === 'intro') {
+    if (k === 'ok') { setState('play'); okLatch = true; }
+  } else if (state === 'play') {
+    if (k === 'ok' && !okLatch) {
+      okActive = true; okT = 0; okUsed = false;
+      // Moving (or still gliding just after letting go of the direction): jump at once.
+      if (canAct() && !context() && (Math.abs(p.vx) >= C.MOVE_V || p.runT < C.RUN_GRACE_S)) { jump(); okUsed = true; }
+    }
+  } else if (state === 'pause') {
+    if (k === 'up') { pauseSel = (pauseSel + 2) % 3; SFX.move(); }
+    else if (k === 'down') { pauseSel = (pauseSel + 1) % 3; SFX.move(); }
+    else if (k === 'ok') {
+      SFX.select();
+      if (pauseSel === 0) { setState('play'); okLatch = true; }
+      else if (pauseSel === 1) startLevel(levelIdx);
+      else toTitle();
+    }
+  } else if (state === 'win' || state === 'lose' || state === 'over') {
+    if (stateT < 0.8) return;
+    if (k === 'ok') {
+      if (state === 'over') toTitle();
+      else if (state === 'lose') startLevel(levelIdx);
+      else if (levelIdx + 1 < LEVELS.length) startLevel(levelIdx + 1);
+      else toTitle();
+    } else if (k === 'up') toTitle();
+  }
+}
+function onRelease(k) {
+  if (k !== 'ok') return;
+  if (okLatch) { okLatch = false; return; }
+  if (state === 'play' && okActive) {
+    if (okT <= C.TAP_S && !okUsed) tap();
+    okActive = false; okUsed = false; p.hidden = false;
+  }
+}
+function chord() {   // browser-only shortcut; the device pauses by pushing into a wall
+  if (state === 'play') { pauseSel = 0; setState('pause'); SFX.select(); }
+  else if (state === 'pause') { setState('play'); SFX.select(); }
+}
+
+// --- helpers ----------------------------------------------------------------
+const pcx = () => p.x + PW / 2;
+const pcol = () => Math.floor(pcx() / T);
+const canAct = () => p.knock <= 0 && !p.air && p.slip <= 0;
+const context = () => atExit() || atStairs() || doorAhead();
+const atStairs = () => lv.stairs.find(s => s.f === p.f && Math.abs(s.col * T + 8 - pcx()) < 9);
+const atHide = () => lv.hides.find(h => h.f === p.f && Math.abs(h.col * T + 8 - pcx()) < 9);
+const atExit = () => lv.exit && lv.exit.f === p.f && Math.abs(lv.exit.col * T + 8 - pcx()) < 10;
+function doorAhead() {
+  return lv.doors.find(d => d.f === p.f && Math.abs(doorX(d) - pcx()) < 16 && (d.open || Math.sign(doorX(d) - pcx()) === p.face));
+}
+const lootLeft = () => lv.loot.filter(l => l.state !== 'carried').length;
+const anyAlert = () => lv && lv.guards.some(gd => gd.state === 'alert');
+function addFx(text, x, f, c = '#ffe066') { fx.push({ text, x, y: f * FH + 58 - 36, c, life: 1.0 }); }   // y below the roof line
+function addScore(n, x, f) { score += n; if (x !== undefined) addFx(`+${n}`, x, f); }
+
+function noise(x, f, r) {
+  for (const gd of lv.guards) {
+    if (gd.f !== f || gd.state === 'stunned' || gd.state === 'alert') continue;
+    if (Math.abs(center(gd) - x) > r || closedDoorBetween(f, center(gd), x) && Math.abs(center(gd) - x) > 24) continue;
+    if (gd.state === 'sleep') gd.bubble = '!?';
+    gd.state = 'investigate'; gd.tx = x - PW / 2; gd.t = 0; gd.bubble = '?';
+  }
+}
+
+function tap() {
+  if (!canAct()) return;
+  if (atExit()) {
+    if (lootLeft() === 0) { escape(); return; }
+    SFX.locked(); addFx(`仲差 ${lootLeft()} 件！`, pcx(), p.f, '#ff8080'); return;
+  }
+  const st = atStairs();
+  if (st) { p.f = st.f + st.dir; p.vx = 0; p.x = st.col * T + 2; fade = 0.3; SFX.stairs(); return; }
+  const d = doorAhead();
+  if (d) { toggleDoor(d, p.face, true); return; }
+  shoot();
+}
+function jump() {
+  const run = Math.max(Math.abs(p.vx), p.runT < C.RUN_GRACE_S ? p.runV : 0);
+  if (run > Math.abs(p.vx)) p.vx = p.face * run;      // keep the run-up speed through the jump
+  p.vy = C.JUMP_V + run * C.JUMP_RUN; p.air = true; p.jhold = C.JUMP_HOLD_S; p.hidden = false; SFX.jump();
+}
+function toggleDoor(d, dir, byPlayer) {
+  if (d.open) { d.open = false; SFX.door(); return; }
+  d.open = true; d.side = dir; d.anim = 0.25; SFX.door();
+  // Anyone standing just behind the door gets flattened.
+  const dx = doorX(d);
+  if (byPlayer) {
+    for (const gd of lv.guards) {
+      if (gd.f !== d.f || gd.state === 'stunned') continue;
+      const off = (center(gd) - dx) * dir;
+      if (off > 0 && off < 22) {
+        gd.state = 'stunned'; gd.stun = gd.type === 'd' ? C.DOG_STUN_S : C.SLAM_STUN_S; gd.spot = 0;
+        SFX.slam(); addFx('BONK!', center(gd), gd.f, '#ffb060'); addScore(C.SCORE_SLAM, center(gd), gd.f);
+        noise(dx, d.f, C.NOISE_SLAM);
+      }
+    }
+  } else if (p.f === d.f && !p.hidden && p.inv <= 0) {
+    const off = (pcx() - dx) * dir;
+    if (off > 0 && off < 22) hitPlayer('被門撞暈！');
+  }
+}
+// The stun gun fires a slow, glowing pellet; whoever it touches first sees stars.
+// It is quiet at the muzzle but pops where it lands (NOISE_GUN around the impact).
+function shoot() {
+  if (p.gunCd > 0) return;
+  p.gunCd = C.GUN_CD; p.muzzle = 0.1; SFX.zap();
+  bolts.push({ x: pcx() + p.face * 8, f: p.f, vx: p.face * C.GUN_V, left: C.GUN_RANGE });
+}
+function boltHits(b, gd) {
+  if (gd.type === 'G' && gd.face === -Math.sign(b.vx) && gd.state !== 'sleep') {
+    SFX.block(); addFx('擋！', center(gd), gd.f, '#aaa');
+    gd.state = 'alert'; gd.spot = 1; gd.bubble = '!'; everSpotted = true; return;
+  }
+  gd.state = 'stunned'; gd.stun = gd.type === 'd' ? C.DOG_STUN_S : C.STUN_S; gd.spot = 0;
+  addScore(C.SCORE_STUN, center(gd), gd.f);
+}
+function hitPlayer(why) {
+  if (p.inv > 0 || p.knock > 0 || state !== 'play') return;
+  SFX.hit(); lives--; p.knock = C.KNOCK_S; p.vx = 0; p.hidden = false; p.slip = 0;
+  if (p.air) { p.y = p.thru ? 0 : support(p.f, p.x); p.vy = 0; p.air = false; p.spring = false; p.thru = false; }
+  addFx(why, pcx(), p.f, '#ff6060');
+  // drop only the last thing we picked up, just behind us
+  const l = p.carry.pop();
+  if (l) { l.state = 'floor'; l.f = p.f; l.x = Math.max(4, Math.min(levelW() - 14, p.x - p.face * 14)); SFX.drop(); }
+  shots = [];
+  for (const gd of lv.guards) if (gd.state === 'alert' && gd.f === p.f) { gd.state = 'investigate'; gd.tx = gd.x; gd.spot = 0; gd.bubble = 'HA!'; }
+  if (lives <= 0) { loseReason = '俾警衛捉住 BUSTED'; gameOver(); }
+}
+function escape() {
+  const lootSum = p.carry.reduce((a, l) => a + l.value, 0);
+  const tb = Math.floor(timeLeft) * C.SCORE_TIME, ghost = everSpotted ? 0 : C.SCORE_GHOST;
+  const stars = 1 + (timeLeft >= lv.L.time * 0.4 ? 1 : 0) + (everSpotted ? 0 : 1);
+  result = { loot: lootSum, time: tb, ghost, action: score, stars, total: lootSum + tb + ghost + score };
+  levelDone(stars);
+  totalScore += result.total;
+  if (totalScore > hiscore) { hiscore = totalScore; localStorage.setItem('heist.hiscore', hiscore); }
+  SFX.escape(); setState('escape');
+}
+function endBonus(why) {
+  const bars = lv.loot.filter(l => l.state === 'carried').length, all = bars === lv.loot.length;
+  const stars = all ? 3 : bars * 3 >= lv.loot.length * 2 ? 2 : 1;
+  result = { bonus: true, bars, of: lv.loot.length, total: score + (all ? C.SCORE_ALLBARS : 0), all, why, stars };
+  levelDone(stars);
+  totalScore += result.total;
+  if (totalScore > hiscore) { hiscore = totalScore; localStorage.setItem('heist.hiscore', hiscore); }
+  all ? SFX.escape() : SFX.lose(); setState('win');
+}
+function gameOver() {
+  if (totalScore + score > hiscore) { hiscore = totalScore + score; localStorage.setItem('heist.hiscore', hiscore); }
+  SFX.lose(); setState('over');
+}
+
+// --- update -------------------------------------------------------------------
+function update(dt) {
+  time += dt; stateT += dt;
+  if (popupT > 0) popupT -= dt;
+  if (state === 'intro' && stateT > 2.6) setState('play');
+  if (state === 'escape') {
+    escapeT += dt;
+    const want = Math.max(0, Math.min(levelW() - SW, lv.exit.col * T + 8 - SW / 2));
+    cam += (want - cam) * Math.min(1, dt * 6);
+    followY(0, dt);
+    if (escapeT > 2.6) setState('win');
+    return;
+  }
+  if (state !== 'play') return;
+  music();
+  if (fade > 0) fade -= dt;
+  timeLeft -= dt;
+  if (timeLeft < 20 && Math.floor(timeLeft + dt) !== Math.floor(timeLeft)) SFX.tick();
+  if (timeLeft <= 0) {
+    timeLeft = 0;
+    if (lv.L.bonus) { endBonus('時間到'); return; }
+    lives--; loseReason = '時間到！TIME UP';
+    if (lives <= 0) gameOver(); else { SFX.lose(); setState('lose'); }
+    return;
+  }
+
+  // --- player ---
+  if (p.gunCd > 0) p.gunCd -= dt;
+  if (p.muzzle > 0) p.muzzle -= dt;
+  if (p.inv > 0) p.inv -= dt;
+  if (p.knock > 0) { p.knock -= dt; if (p.knock <= 0) p.inv = C.INVULN_S; }
+  if (okActive && keys.ok) okT += dt;
+  const atH = !p.air && atHide();
+  // Standing still and holding OK: hide at an alcove at once; anywhere else it becomes a jump after TAP_S.
+  if (okActive && keys.ok && !okUsed && okT > C.TAP_S && canAct() && !atH) { jump(); okUsed = true; }
+  p.hidden = okActive && keys.ok && !okUsed && !!atH && p.knock <= 0;
+  let dir = 0;
+  if (!(okActive && keys.ok) && p.knock <= 0 && p.slip <= 0 && keys.up !== keys.down) dir = keys.up ? -1 : 1;
+  if (dir) { p.runT = 0; p.runV = Math.abs(p.vx); } else p.runT += dt;
+  if (p.slip > 0) {                                  // banana: sliding, no control
+    p.slip -= dt; p.vx *= Math.pow(0.15, dt);
+  } else if (p.air) {
+    if (dir) { p.vx += dir * C.AIR_ACCEL * dt; p.face = dir; p.vx = Math.max(-C.WALK, Math.min(C.WALK, p.vx)); }
+  } else if (dir) { p.vx += dir * C.ACCEL * dt; p.face = dir; p.vx = Math.max(-C.WALK, Math.min(C.WALK, p.vx)); }
+  else { const d = C.FRICTION * dt; p.vx = Math.abs(p.vx) <= d ? 0 : p.vx - Math.sign(p.vx) * d; }
+  const [lo, hi] = limits(p.f, p.x, p.y);
+  p.x += p.vx * dt;
+  let pinned = false;
+  // in the air we keep the momentum against an obstacle, so a jump that starts a bit late still rises onto a crate
+  if (p.x < lo) { p.x = lo; if (!p.air) p.vx = 0; pinned = dir < 0; }
+  if (p.x > hi) { p.x = hi; if (!p.air) p.vx = 0; pinned = dir > 0; }
+  p.push = pinned && !p.air ? p.push + dt : 0;
+  if (p.push >= C.PAUSE_PUSH_S) { p.push = 0; pauseSel = 0; setState('pause'); SFX.select(); return; }
+  if (p.vx !== 0 && !p.air) p.walkT += dt;
+  // vertical: jumps, crates, springboards
+  const sup = support(p.f, p.x);
+  if (!p.air && p.y > sup) { p.air = true; p.vy = 0; p.jhold = 0; }   // walked off a crate
+  if (p.air) {
+    const grav = (p.vy > 0 && p.jhold > 0 && okActive && keys.ok) ? C.HOLD_GRAV : C.GRAVITY;
+    p.jhold -= dt; p.vy -= grav * dt; p.y += p.vy * dt;
+    if (p.spring && p.y >= FH - 8) { p.f -= 1; p.y -= FH; p.spring = false; p.thru = true; }           // through the hatch to the floor above
+    else if (!p.spring && p.y > C.CEIL) { p.y = C.CEIL; p.vy = Math.min(p.vy, 0); }   // head would touch the ceiling
+    if (p.thru && p.y >= 0) p.thru = false;
+    if (p.vy <= 0 && p.y <= sup) {
+      p.y = sup; p.vy = 0; p.air = false; p.spring = false; p.thru = false; SFX.land();
+    }
+  }
+  if (!p.air && p.y === 0 && p.knock <= 0) {
+    const b = lv.springs.find(b => b.f === p.f && Math.abs(b.col * T + 8 - pcx()) < 6);
+    if (b) { p.vy = C.SPRING_V; p.vx = 0; p.x = b.col * T + 2; p.air = true; p.spring = true; p.jhold = 0; b.anim = 0.3; SFX.boing(); addFx('BOING!', pcx(), p.f, '#9bd93a'); }
+    for (const pe of lv.peels) {
+      if (pe.cd > 0 || pe.f !== p.f || Math.abs(pe.x - pcx()) > 6 || Math.abs(p.vx) < 15) continue;
+      pe.cd = 1.5; p.slip = C.SLIP_S; p.vx = Math.sign(p.vx) * C.WALK * 1.3; SFX.slip(); addFx('哎呀！', pcx(), p.f, '#ffe066'); noise(pcx(), p.f, C.NOISE_SLIP);
+    }
+  }
+  for (const pe of lv.peels) if (pe.cd > 0) pe.cd -= dt;
+  for (const b of lv.springs) if (b.anim > 0) b.anim -= dt;
+
+  // loot: walk over to grab it
+  for (const l of lv.loot) {
+    if (l.state !== 'floor' || l.f !== p.f || p.knock > 0 || p.y > 20) continue;
+    if (Math.abs(l.x + 5 - pcx()) < 9) {
+      l.state = 'carried'; p.carry.push(l); SFX.pick();
+      if (lv.L.bonus) addScore(l.value, pcx(), p.f); else addFx(`$${l.value}`, pcx(), p.f);
+      if (!lv.L.bonus && lootLeft() === 0) addFx('全部到手！上天台！', pcx(), p.f, '#9bd93a');
+    }
+  }
+  if (lv.L.bonus) {
+    if (lootLeft() === 0) { endBonus('全部金磚到手！'); return; }
+    for (const s of lv.lights) {
+      s.x += s.sp * s.dir * dt;
+      if (s.x < 10) { s.x = 10; s.dir = 1; } if (s.x > levelW() - 10 - s.w) { s.x = levelW() - 10 - s.w; s.dir = -1; }
+      if (s.f === p.f && !p.hidden && pcx() > s.x + 2 && pcx() < s.x + s.w - 2) { SFX.alert(); endBonus('俾探射燈照到！'); return; }
+    }
+  }
+  // cans: walking over one makes a racket
+  for (const c of lv.cans) {
+    if (c.cd > 0) c.cd -= dt;
+    c.x += c.vx * dt; c.vx *= Math.pow(0.02, dt);
+    if (c.f === p.f && !p.air && Math.abs(c.x - pcx()) < 7 && Math.abs(p.vx) > 15 && c.cd <= 0) {
+      c.cd = 1.0; c.vx = p.vx * 1.6; SFX.clatter(); addFx('匡啷！', c.x, c.f, '#ccc'); noise(c.x, c.f, C.NOISE_CAN);
+    }
+  }
+
+  // --- guards ---
+  for (const gd of lv.guards) updateGuard(gd, dt);
+
+  // --- shots ---
+  for (const s of shots) {
+    s.x += s.vx * dt; s.life -= dt;
+    const [a, b] = [s.x - 2, s.x + 2];
+    if (lv.doors.some(d => d.f === s.f && !d.open && Math.abs(doorX(d) - s.x) < 3)) s.life = 0;
+    // darts fly at knee height: a held jump clears them
+    if (s.f === p.f && !p.hidden && p.y <= C.DART_H && a < p.x + PW && b > p.x && s.life > 0) { s.life = 0; hitPlayer('中咗麻醉彈！'); }
+  }
+  shots = shots.filter(s => s.life > 0);
+  // --- stun-gun pellets ---
+  for (const b of bolts) {
+    const step = b.vx * dt; b.x += step; b.left -= Math.abs(step);
+    if (lv.doors.some(d => d.f === b.f && !d.open && Math.abs(doorX(d) - b.x) < 4)) { b.left = 0; continue; }
+    if (lv.crates.some(k => k.f === b.f && b.x > k.col * T && b.x < k.col * T + T)) { b.left = 0; continue; }
+    const gd = lv.guards.find(gd => gd.f === b.f && gd.state !== 'stunned' && Math.abs(center(gd) - b.x) < 8);
+    if (gd) { b.left = 0; boltHits(b, gd); }
+    if (b.left <= 0) noise(b.x, b.f, C.NOISE_GUN);     // the pellet pops where it lands: nearby guards come to look
+  }
+  bolts = bolts.filter(b => b.left > 0);
+  for (const e of fx) { e.life -= dt; e.y -= 14 * dt; }
+  fx = fx.filter(e => e.life > 0);
+
+  // camera
+  const want = Math.max(0, Math.min(levelW() - SW, pcx() - SW / 2 + p.face * 24));
+  cam += (want - cam) * Math.min(1, dt * 6);
+  followY(p.f, dt);
+}
+function followY(f, dt) {   // tall buildings: glide to the floor in view
+  const ty = viewY0(f);
+  Y0 += (ty - Y0) * Math.min(1, dt * 8);
+  if (Math.abs(ty - Y0) < 0.5) Y0 = ty;
+}
+
+function canSee(gd) {
+  if (p.f !== gd.f || p.hidden || p.knock > 0 || p.spring || p.thru) return false;
+  const d = (pcx() - center(gd)) * gd.face, range = gd.type === 'd' ? C.DOG_VISION : C.VISION;
+  if (d < -10 || d > range) return false;
+  if (d < 0 && d > -10) return true;                    // bumping into his back
+  return !closedDoorBetween(gd.f, center(gd), pcx());
+}
+
+function moveGuard(gd, speed, dt, tx) {
+  const dir = Math.sign(tx - gd.x);
+  if (!dir || Math.abs(tx - gd.x) < 1) { gd.vx = 0; return true; }
+  gd.face = dir; gd.vx = dir * speed;
+  let [lo, hi] = limits(gd.f, gd.x, 0);
+  const nx = gd.x + gd.vx * dt;
+  if (nx < lo || nx > hi) {
+    // a closed door in the way: alerted / investigating guards open it, patrols turn back
+    const door = lv.doors.find(d => d.f === gd.f && !d.open && Math.abs(doorX(d) - center(gd)) < 16 && Math.sign(doorX(d) - center(gd)) === dir);
+    if (door && gd.state !== 'patrol' && gd.type !== 'd') { toggleDoor(door, dir, false); return false; }
+    gd.x = Math.max(lo, Math.min(hi, gd.x)); gd.vx = 0; return true;
+  }
+  gd.x = nx; gd.walkT += dt;
+  return Math.abs(tx - gd.x) < 1.5;
+}
+
+function updateGuard(gd, dt) {
+  gd.t += dt;
+  if (gd.state === 'stunned') {
+    gd.stun -= dt; gd.vx = 0;
+    if (gd.stun <= 0) { gd.state = 'investigate'; gd.tx = gd.x; gd.t = 0; gd.bubble = '?'; }
+    return;
+  }
+  if (gd.state === 'sleep') {
+    gd.vx = 0;
+    const near = p.f === gd.f && !p.hidden && Math.abs(pcx() - center(gd)) < C.SLEEP_NEAR;
+    gd.nearT = near ? gd.nearT + dt : Math.max(0, gd.nearT - dt);
+    if (gd.nearT > C.SLEEP_WAKE_S) { gd.state = 'investigate'; gd.tx = p.x; gd.t = 0; gd.bubble = '!?'; }
+    return;
+  }
+  // Seeing the player fills the spot meter; full means alert.
+  if (canSee(gd)) {
+    const dist = Math.abs(pcx() - center(gd));
+    gd.spot += dt / C.SPOT_S * (dist < 40 ? 2 : 1);
+    if (gd.spot >= 1 && gd.state !== 'alert') {
+      gd.state = 'alert'; gd.spot = 1; gd.bubble = '!'; gd.windup = 0; gd.shotCd = 0.2; gd.lostT = 0; everSpotted = true; SFX.alert();
+    }
+  } else if (gd.state !== 'alert') gd.spot = Math.max(0, gd.spot - dt * (p.hidden ? 1.5 : 0.6));
+
+  if (gd.state === 'alert') {
+    const sees = canSee(gd);
+    if (!sees) {
+      gd.lostT += dt;
+      if (gd.lostT > C.LOSE_S) { gd.state = 'investigate'; gd.tx = gd.x; gd.t = 0; gd.spot = 0; gd.bubble = '?'; return; }
+    } else { gd.lostT = 0; gd.tx = p.x; }
+    if (gd.type === 'd') {                                // dogs charge
+      moveGuard(gd, C.DOG_CHARGE, dt, gd.tx);
+    } else {
+      const dist = Math.abs(pcx() - center(gd));
+      if (dist > C.KEEP_DIST || !sees) moveGuard(gd, C.ALERT_SPEED, dt, gd.tx); else { gd.vx = 0; gd.face = Math.sign(pcx() - center(gd)) || gd.face; }
+      if (sees && p.f === gd.f && p.f === gd.f) {
+        gd.shotCd -= dt;
+        if (gd.shotCd <= 0) {
+          gd.windup += dt;
+          if (gd.windup >= C.SHOT_WINDUP) {
+            gd.windup = 0; gd.shotCd = C.SHOT_CD; SFX.shot();
+            shots.push({ x: center(gd) + gd.face * 8, f: gd.f, vx: gd.face * C.SHOT_V, life: 2.5 });
+          }
+        }
+      } else gd.windup = 0;
+    }
+  } else if (gd.state === 'investigate') {
+    if (moveGuard(gd, C.GUARD_SPEED * 1.4, dt, gd.tx)) {
+      gd.vx = 0;
+      if (gd.t > 2.5) { gd.state = 'patrol'; gd.t = 0; gd.bubble = ''; gd.home = gd.x; }
+      else gd.face = Math.floor(gd.t * 1.5) % 2 ? 1 : -1;   // look around
+    }
+  } else if (gd.state === 'patrol') {
+    const sp = gd.type === 'd' ? C.DOG_SPEED : C.GUARD_SPEED;
+    const span = C.PATROL_COLS * T;
+    if (gd.wait > 0) { gd.wait -= dt; gd.vx = 0; if (gd.wait <= 0) gd.face = -gd.face; }
+    else {
+      const target = gd.home + gd.face * span;
+      const done = moveGuard(gd, sp, dt, target);
+      if (done || gd.vx === 0) { gd.wait = C.PATROL_WAIT; }
+    }
+  }
+  // touching an awake guard (or a dog) catches you
+  if (p.f === gd.f && Math.abs(pcx() - center(gd)) < 10 && !p.hidden && p.y < (gd.type === 'd' ? 12 : 30) && gd.state !== 'stunned' && gd.state !== 'sleep') {
+    if (gd.state === 'alert' || gd.type === 'd' || canSee(gd)) hitPlayer(gd.type === 'd' ? '俾狗咬！' : '俾警衛捉住！');
+  }
+  if (gd.bubble && gd.t > 1.5 && gd.state !== 'alert') gd.bubble = '';
+}
+
+// --- drawing ----------------------------------------------------------------
+function R(x, y, w, h, c) { g.fillStyle = c; g.fillRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h)); }
+function text(s, x, y, c = '#fff', size = 8, align = 'left') {
+  g.font = `bold ${size}px ${FONT}`; g.textAlign = align; g.textBaseline = 'top';
+  g.fillStyle = '#000'; g.fillText(s, x + 0.6, y + 0.6);
+  g.fillStyle = c; g.fillText(s, x, y);
+}
+function bar(x, y, w, h, v, c) { R(x, y, w, h, '#000'); R(x + 1, y + 1, Math.max(0, (w - 2) * Math.max(0, Math.min(1, v))), h - 2, c); }
+
+function drawFloor(f, ox) {
+  const P = lv.L.pal, top = Y0 + f * FH;
+  R(0, top, SW, FH, P.wall);
+  for (let x = -((cam | 0) % 8); x < SW; x += 8) R(x, top + 4, 4, 40, P.stripe);
+  R(0, top + 44, SW, 14, P.dado);
+  R(0, top + 58, SW, 6, P.floor); R(0, top + 58, SW, 1, '#00000055');
+  R(0, top, SW, 3, '#1a1a22');
+  // moonlit windows every 6 columns
+  for (let col = 2; col < lv.W; col += 6) {
+    const x = col * T + ox; if (x < -24 || x > SW) continue;
+    R(x, top + 12, 18, 22, '#1b2440'); R(x + 1, top + 13, 16, 20, '#2b3f6e'); R(x + 8, top + 13, 2, 20, '#1b2440');
+    R(x + 3, top + 15, 3, 3, '#e8e8c0');
+  }
+  // light pools from ceiling lamps
+  for (let col = 5; col < lv.W; col += 8) {
+    const x = col * T + ox; if (x < -40 || x > SW + 40) continue;
+    R(x + 4, top + 3, 8, 3, '#ccc'); g.globalAlpha = 0.07; R(x - 8, top + 6, 32, 52, '#ffeeaa'); g.globalAlpha = 1;
+  }
+}
+function drawHide(h, ox) {
+  const x = h.col * T + ox, top = Y0 + h.f * FH;
+  if (x < -20 || x > SW) return;
+  R(x - 1, top + 6, 18, 52, '#00000055');                // alcove recess
+  R(x - 3, top + 4, 3, 54, '#c9bfa8'); R(x + 16, top + 4, 3, 54, '#c9bfa8');   // pillars
+  R(x - 4, top + 4, 26, 3, '#ddd3bb');
+  const hid = p.hidden && p.f === h.f && Math.abs(h.col * T + 8 - pcx()) < 9;
+  if (hid) { g.globalAlpha = 0.5; R(x, top + 6, 16, 52, '#000'); g.globalAlpha = 1; }
+}
+function drawStairs(s, ox) {
+  const x = s.col * T + ox, top = Y0 + s.f * FH;
+  if (x < -40 || x > SW + 20) return;
+  if (s.dir < 0) {           // going up: steps rising to the ceiling
+    for (let i = 0; i < 7; i++) R(x - 8 + i * 4, top + 52 - i * 8, 10, 4, '#8a7058');
+    R(x - 10, top + 4, 34, 2, '#00000044');
+  } else {                   // top of the stairs: a railing over a hole in the floor
+    R(x - 6, top + 58, 28, 6, '#1a1410'); R(x - 6, top + 40, 2, 18, '#b0a080'); R(x + 20, top + 40, 2, 18, '#b0a080'); R(x - 6, top + 40, 28, 2, '#b0a080');
+  }
+  text(s.dir < 0 ? '▲' : '▼', x + 4, top + 22, '#ffe06688', 8);
+}
+function drawDoor(d, ox) {
+  const x = doorX(d) + ox, top = Y0 + d.f * FH;
+  if (x < -30 || x > SW + 30) return;
+  R(x - 9, top + 10, 18, 48, '#2a1f18');                  // frame / doorway
+  if (!d.open) { R(x - 3, top + 12, 6, 46, '#8b5a2b'); R(x - 3, top + 12, 6, 2, '#a8743d'); R(x + (d.side > 0 ? 1 : -2), top + 34, 1, 3, '#ffd700'); }
+  else {
+    const w = 14 * (1 - Math.max(0, d.anim) / 0.25) + 2;
+    R(d.side > 0 ? x + 3 : x - 3 - w, top + 12, w, 46, '#6b4420'); R(d.side > 0 ? x + 3 : x - 3 - w, top + 12, w, 2, '#a8743d');
+  }
+}
+function drawExit(ox) {
+  if (!lv.exit) return;
+  const e = lv.exit, x = e.col * T + ox, top = Y0;
+  const open = lootLeft() === 0;
+  for (let i = 0; i < 6; i++) R(x + 2, top + 8 + i * 9, 12, 2, '#9aa');
+  R(x + 1, top + 6, 2, 52, '#9aa'); R(x + 13, top + 6, 2, 52, '#9aa');
+  R(x - 2, top + 50, 20, 8, open ? '#2e8b57' : '#6b2222');
+  text(open ? 'EXIT' : '🔒', x + 8, top + 50, '#fff', 6, 'center');
+}
+const LOOTC = { gold: '#ffd84a', watch: '#c0c8d0', jade: '#4fd18b', vase: '#5aa0e0', painting: '#e07a4a', jewel: '#ff5fa0', bar: '#ffd84a' };
+function drawLoot(l, ox) {
+  if (l.state !== 'floor') return;
+  const x = l.x + ox, y = feetY(l.f) - 10, c = LOOTC[l.kind] || '#ffd84a';
+  if (x < -12 || x > SW) return;
+  const bob = Math.round(Math.sin(time * 4 + l.x) * 1.5);
+  if (l.kind === 'gold' || l.kind === 'bar') { R(x, y + 4 + bob, 10, 5, '#b8901e'); R(x + 1, y + 3 + bob, 8, 4, c); }
+  else if (l.kind === 'painting') { R(x - 1, y - 4 + bob, 12, 12, '#7a5a2a'); R(x + 1, y - 2 + bob, 8, 8, c); R(x + 3, y + 2 + bob, 4, 3, '#4a7'); }
+  else if (l.kind === 'vase') { R(x + 2, y + bob, 6, 9, c); R(x + 3, y - 2 + bob, 4, 2, c); R(x + 3, y + 3 + bob, 4, 2, '#fff8'); }
+  else if (l.kind === 'watch') { R(x + 3, y - 1 + bob, 4, 11, '#5a4030'); R(x + 1, y + 2 + bob, 8, 6, c); R(x + 4, y + 4 + bob, 2, 2, '#333'); }
+  else { R(x + 2, y + 2 + bob, 6, 6, c); R(x + 4, y + bob, 2, 10, c); R(x, y + 4 + bob, 10, 2, c); }
+  if (Math.floor(time * 3 + l.x) % 3 === 0) R(x + 8, y - 2 + bob, 2, 2, '#fff');
+}
+function drawCrate(k, ox) {
+  const x = k.col * T + ox + 1, y = feetY(k.f) - C.CRATE_H;
+  if (x < -20 || x > SW) return;
+  R(x, y, 14, 14, '#9a6a3a'); R(x, y, 14, 2, '#c08850'); R(x + 1, y + 6, 12, 2, '#7a4a20'); R(x + 1, y + 2, 2, 12, '#7a4a20'); R(x + 11, y + 2, 2, 12, '#7a4a20');
+}
+function drawPeel(pe, ox) {
+  const x = pe.x + ox - 5, y = feetY(pe.f) - 3;
+  if (x < -12 || x > SW) return;
+  R(x, y, 10, 3, '#f5d63a'); R(x - 2, y + 1, 3, 2, '#f5d63a'); R(x + 9, y + 1, 3, 2, '#f5d63a'); R(x + 4, y - 1, 2, 2, '#8a6a20');
+}
+function drawSpring(b, ox) {
+  const x = b.col * T + ox, y = feetY(b.f), sq = b.anim > 0 ? 3 : 0;
+  if (x < -20 || x > SW) return;
+  R(x + 1, y - 3, 14, 3, '#555');
+  for (let i = 0; i < 3; i++) R(x + 3, y - 5 - i * (3 - sq / 3), 10, 1, '#ccc');
+  R(x, y - 12 + sq, 16, 3, '#e04040'); R(x, y - 12 + sq, 16, 1, '#ff9090');
+}
+function drawHatch(h, ox) {
+  const x = h.col * T + ox, y = feetY(h.f);
+  if (x < -20 || x > SW) return;
+  R(x - 2, y, 20, 6, '#14100c'); for (let i = 0; i < 5; i++) R(x - 1 + i * 4, y + 1, 2, 4, '#5a5a60');
+  R(x - 2, y, 20, 1, '#8a8a90');
+}
+function drawCan(c, ox) { const x = c.x + ox - 3, y = feetY(c.f) - 6; if (x < -8 || x > SW) return; R(x, y, 5, 6, '#c33'); R(x, y + 1, 5, 1, '#eee'); }
+
+function drawThief(x, f, face, walkT, carry, hidden, alpha = 1, lift = 0, air = false) {
+  const y = feetY(f) - Math.round(lift);
+  g.globalAlpha = alpha * (hidden ? 0.45 : 1);
+  const step = Math.floor(walkT * 8) % 2;
+  // legs (tucked when airborne)
+  if (air) { R(x + 2, y - 10, 9, 4, '#232a40'); R(x + (face > 0 ? 8 : 0), y - 8, 5, 3, '#111'); R(x + (face > 0 ? 0 : 8), y - 6, 5, 3, '#111'); }
+  else {
+    R(x + 3, y - 10, 3, 10 - (step ? 2 : 0), '#232a40'); R(x + 7, y - 10, 3, 10 - (step ? 0 : 2), '#232a40');
+    R(x + 2 + (face > 0 ? 1 : 0), y - 2, 5, 2, '#111'); R(x + 6 + (face > 0 ? 1 : 0), y - 2, 5, 2, '#111');
+  }
+  // tall striped body
+  for (let i = 0; i < 6; i++) R(x + 2, y - 24 + i * 2.4, 9, 2.4, i % 2 ? '#f2f2f2' : '#1d2b4f');
+  // head + mask + beanie
+  R(x + 2, y - 33, 9, 9, '#f2c9a0'); R(x + 2, y - 30, 9, 3, '#111');
+  R(x + (face > 0 ? 7 : 3), y - 29, 2, 1, '#fff');
+  R(x + 1, y - 35, 11, 4, '#ff7a1a'); R(x + 4, y - 37, 5, 2, '#ff7a1a');
+  // stun gun: a chunky toy-like blaster with a blue tip
+  R(x + (face > 0 ? 9 : -4), y - 20, 7, 3, '#ffcc33'); R(x + (face > 0 ? 15 : -5), y - 20, 2, 3, '#5ad0ff'); R(x + (face > 0 ? 10 : 0), y - 17, 2, 3, '#806010');
+  // loot sack grows with what you carry
+  if (carry > 0) { const s = Math.min(12, 6 + carry * 2); R(x + (face > 0 ? -s + 2 : PW - 2), y - 24, s, s, '#c8b48a'); R(x + (face > 0 ? -s + 4 : PW), y - 26, 4, 3, '#a8946a'); text('$', x + (face > 0 ? -s / 2 + 1 : PW + s / 2 - 3), y - 22, '#6a5a3a', 6); }
+  g.globalAlpha = 1;
+}
+function drawGuard(gd, ox) {
+  const x = gd.x + ox, y = feetY(gd.f);
+  if (x < -30 || x > SW + 30) return;
+  if (gd.type === 'd') {
+    const st = gd.state === 'stunned';
+    R(x, y - 9, 13, 6, '#8a5a30'); R(x + (gd.face > 0 ? 10 : -3), y - 12, 6, 6, '#8a5a30');
+    R(x + (gd.face > 0 ? 14 : -3), y - 10, 2, 2, '#111'); R(x + 1, y - 3, 2, 3, '#6a4020'); R(x + 9, y - 3, 2, 3, '#6a4020');
+    R(x + (gd.face > 0 ? -2 : 13), y - 11, 2, 4, '#8a5a30');
+    if (st) text('★', x + 6, y - 22, '#ffe066', 7, 'center');
+  } else {
+    const st = gd.state === 'stunned', sl = gd.state === 'sleep';
+    if (sl) {      // slumped in a chair
+      R(x - 2, y - 14, 16, 3, '#5a3a20'); R(x - 2, y - 14, 2, 14, '#5a3a20'); R(x + 12, y - 14, 2, 14, '#5a3a20');
+      R(x + 1, y - 26, 10, 12, '#2f4f8f'); R(x + 2, y - 33, 9, 8, '#f2c9a0'); R(x + 1, y - 35, 11, 3, '#1d2b4f');
+      text('z', x + 14, y - 40 - (Math.floor(time * 2) % 2) * 3, '#cde', 8);
+      return;
+    }
+    const step = Math.floor(gd.walkT * 7) % 2;
+    const lean = st ? 4 : 0;
+    R(x + 3, y - 10, 3, 10 - (step && gd.vx ? 2 : 0), '#1d2b4f'); R(x + 7, y - 10, 3, 10 - (step || !gd.vx ? 0 : 2), '#1d2b4f');
+    R(x + 1, y - 25, 11, 15, '#2f4f8f'); R(x + 5, y - 22, 2, 2, '#ffd700');
+    R(x + 2 + lean, y - 33, 9, 8, '#f2c9a0'); R(x + 1 + lean, y - 36, 11, 4, '#1d2b4f'); R(x + (gd.face > 0 ? 8 : -1) + lean, y - 33, 4, 2, '#1d2b4f');
+    R(x + (gd.face > 0 ? 7 : 4) + lean, y - 30, 2, 2, '#111');
+    if (gd.type === 'G') { R(x + (gd.face > 0 ? 12 : -4), y - 28, 4, 24, '#9aa8b8'); R(x + (gd.face > 0 ? 13 : -3), y - 26, 2, 20, '#c8d4e0'); }
+    if (gd.state === 'alert' && gd.windup > 0) R(x + (gd.face > 0 ? 11 : -4), y - 21, 5, 2, '#333');
+    if (st) for (let i = 0; i < 3; i++) text('★', x + 6 + Math.cos(time * 5 + i * 2.1) * 8, y - 42 + Math.sin(time * 5 + i * 2.1) * 3, '#ffe066', 6, 'center');
+  }
+  // spot meter / bubble
+  if (gd.state !== 'stunned') {
+    if (gd.state === 'alert') text('!', x + 6, y - 50, '#ff4040', 12, 'center');
+    else if (gd.spot > 0.05) { R(x - 1, y - 44, 14, 4, '#000'); R(x, y - 43, 12 * gd.spot, 2, '#ffb020'); }
+    else if (gd.bubble) text(gd.bubble, x + 6, y - 48, '#ffe066', 8, 'center');
+  }
+}
+function drawBalloon(x, y) {
+  R(x - 2, y + 20, 4, 6, '#7a5a3a');
+  const cols = ['#e04040', '#f2f2f2'];
+  for (let i = 0; i < 6; i++) { const w = [8, 14, 18, 18, 14, 8][i]; for (let j = 0; j < w; j += 3) R(x - w / 2 + j, y - 6 + i * 3, 3, 3, cols[(j / 3 | 0) % 2]); }
+  R(x - 1, y + 12, 1, 8, '#ccc'); R(x + 1, y + 12, 1, 8, '#ccc');
+  R(x - 5, y + 20, 10, 6, '#a0784a');
+  // the partner: round, green cap, waving
+  R(x - 3, y + 14, 6, 6, '#f2c9a0'); R(x - 4, y + 13, 8, 2, '#2e8b57'); R(x + 3 + Math.round(Math.sin(time * 8)), y + 15, 2, 4, '#f2c9a0');
+}
+
+function drawWorld() {
+  const ox = -Math.round(cam);
+  // roof band: night sky, moon, rooftop, the getaway balloon over the exit
+  R(0, HUD_H, SW, Y0 - HUD_H, '#0f1530');
+  for (let i = 0; i < 18 + (Y0 - HUD_H - ROOF_H) / 3; i++) R(((i * 53 + 7 - cam * 0.3) % SW + SW) % SW, HUD_H + 2 + (i * 7) % (Y0 - HUD_H - 6), 1, 1, '#ffffff99');
+  R(280 - cam * 0.1 % 40, HUD_H + 3, 8, 8, '#f5f0c8');
+  R(0, Y0 - 4, SW, 4, '#3a3a44');
+  for (let f = 0; f < lv.nF; f++) drawFloor(f, ox);
+  for (const h of lv.hides) drawHide(h, ox);
+  for (const s of lv.stairs) drawStairs(s, ox);
+  drawExit(ox);
+  if (lv.exit) {
+    let by = Y0 - 22;
+    if (state === 'escape') by -= escapeT * 18;
+    drawBalloon(lv.exit.col * T + 8 + ox, by);
+  }
+  for (const d of lv.doors) drawDoor(d, ox);
+  for (const l of lv.loot) drawLoot(l, ox);
+  for (const c of lv.cans) drawCan(c, ox);
+  for (const k of lv.crates) drawCrate(k, ox);
+  for (const pe of lv.peels) drawPeel(pe, ox);
+  for (const b of lv.springs) drawSpring(b, ox);
+  for (const h of lv.hatches) drawHatch(h, ox);
+  // bonus spotlights
+  for (const s of lv.lights) {
+    const top = Y0 + s.f * FH;
+    g.globalAlpha = 0.28; R(s.x + ox, top + 4, s.w, 54, '#fff6a0'); g.globalAlpha = 0.5; R(s.x + ox + 4, top + 54, s.w - 8, 4, '#fff6a0'); g.globalAlpha = 1;
+    R(s.x + ox + s.w / 2 - 4, top + 3, 8, 3, '#ddd');
+  }
+  for (const gd of lv.guards) drawGuard(gd, ox);
+  if (state !== 'escape') {
+    const blink = (p.inv > 0 && Math.floor(time * 12) % 2) ? 0.3 : 1;
+    if (p.knock > 0) { const y = feetY(p.f); R(p.x + ox - 6, y - 6, 24, 6, '#1d2b4f'); R(p.x + ox + 14, y - 9, 8, 8, '#f2c9a0'); text('@', p.x + ox + 18, y - 22, '#ffe066', 8, 'center'); }
+    else drawThief(p.x + ox, p.f, p.face, p.walkT, p.carry.length, p.hidden, blink, p.y, p.air);
+    if (p.slip > 0) text('★ ★', pcx() + ox, feetY(p.f) - 46, '#ffe066', 7, 'center');
+  } else {
+    const ex = lv.exit.col * T + 8 + ox, by = Y0 - 22 - escapeT * 18;
+    if (escapeT < 0.8) drawThief(ex - 6, 0, 1, time, p.carry.length, false);
+    else { R(ex - 3, by + 14, 6, 6, '#f2c9a0'); R(ex - 4, by + 12, 8, 3, '#ff7a1a'); }
+  }
+  if (p.muzzle > 0 && state === 'play') R(pcx() + ox + (p.face > 0 ? 11 : -17), feetY(p.f) - p.y - 22, 6, 6, '#bff4ff');
+  for (const b of bolts) { const y = feetY(b.f) - 20; R(b.x + ox - 3, y - 1, 6, 4, '#5ad0ff'); R(b.x + ox - 2, y, 4, 2, '#fff'); R(b.x + ox - 3 - Math.sign(b.vx) * 5, y, 4, 2, '#5ad0ff66'); }
+  for (const s of shots) R(s.x + ox - 2, feetY(s.f) - C.DART_H, 5, 2, '#9f6');
+  for (const e of fx) { g.globalAlpha = Math.max(0, Math.min(1, e.life * 2)); text(e.text, e.x + ox, Y0 + e.y, e.c, 8, 'center'); g.globalAlpha = 1; }
+  if (p.push > 0.35 && state === 'play') {
+    const v = p.push / C.PAUSE_PUSH_S; R(pcx() + ox - 16, feetY(p.f) - 52, 32, 10, '#000a'); bar(pcx() + ox - 14, feetY(p.f) - 50, 28, 4, v, '#f2c21b'); text('PAUSE', pcx() + ox, feetY(p.f) - 47, '#fff', 5, 'center');
+  }
+  if (fade > 0) { g.globalAlpha = Math.min(1, fade / 0.3); R(0, Y0, SW, SH - Y0, '#000'); g.globalAlpha = 1; }
+}
+
+function drawHUD() {
+  R(0, 0, SW, HUD_H, '#101014'); R(0, HUD_H - 1, SW, 1, '#333');
+  text('♥'.repeat(Math.max(0, lives)), 3, 1, '#ff5a5a', 8);
+  const tl = Math.ceil(timeLeft), low = timeLeft < 30 && Math.floor(time * 4) % 2;
+  text(`${Math.floor(tl / 60)}:${String(tl % 60).padStart(2, '0')}`, 3, 11, low ? '#ff4040' : '#fff', 8);
+  const got = lv.loot.filter(l => l.state === 'carried').length;
+  text(`${lv.L.bonus ? '金磚' : '寶物'} ${got}/${lv.loot.length}`, 38, 1, '#ffd84a', 8);
+  text(lv.L.name, 38, 11, '#bbb', 7);
+  // mini map: building outline, loot, exit, player
+  const mx = 128, mw = 100, mh = 18, rows = lv.nF, sx = mw / levelW();
+  R(mx, 2, mw, mh, '#1e2233');
+  for (let f = 0; f < rows; f++) R(mx, 2 + (f + 1) * mh / rows - 1, mw, 1, '#333a55');
+  const my = f => 2 + (f + 0.5) * mh / rows - 1;
+  for (const l of lv.loot) if (l.state === 'floor') R(mx + l.x * sx, my(l.f), 2, 2, '#ffd84a');
+  if (lv.exit) R(mx + lv.exit.col * T * sx, my(0) - 1, 3, 3, lootLeft() ? '#a33' : '#3c3');
+  R(mx + cam * sx, 2, SW * sx, mh, '#ffffff14');
+  if (Math.floor(time * 4) % 2) R(mx + pcx() * sx - 1, my(p.f) - 1, 3, 3, '#fff');
+  text(String(totalScore + score).padStart(6, '0'), 316, 6, '#ffe066', 10, 'right');
+}
+
+function hint() {
+  if (p.knock > 0) return '';
+  if (atExit()) return lootLeft() ? `仲差 ${lootLeft()} 件寶物先走得` : 'OK：上天台搭熱氣球走佬！';
+  if (atStairs()) return atStairs().dir < 0 ? 'OK：上樓' : 'OK：落樓';
+  const d = doorAhead();
+  if (d) return d.open ? 'OK：閂門' : 'OK：開門（門後有警衛會撞暈佢）';
+  if (p.air) return '';
+  if (atHide()) return p.hidden ? '匿埋中… 放手出返嚟' : '撳住 OK：匿埋 · 短按：電擊槍';
+  if (lv.springs.some(b => b.f === p.f && Math.abs(b.col * T + 8 - pcx()) < 40)) return '踩上彈床：彈上一層';
+  if (lv.crates.some(k => k.f === p.f && Math.abs(k.col * T + 8 - pcx()) < 34)) return '行緊撳 OK 跳過木箱（撳耐啲跳高啲）';
+  if (lv.peels.some(e => e.f === p.f && Math.abs(e.x - pcx()) < 40)) return '香蕉皮！跳過佢，唔係會跣親兼好大聲';
+  if (anyAlert()) return '俾人發現！匿埋 / 電擊槍 / 跳過飛鏢 / 走去第二層';
+  if (lv.L.bonus) return '避開探射燈，執晒啲金磚！撳住 OK 喺柱位匿埋';
+  if (lv.L.tutorial) return lootLeft() ? '行過寶物就執到 · 企定短按 OK 電擊槍 · 行緊撳 OK 跳' : '全部到手！去頂樓 EXIT';
+  return '';
+}
+
+function drawTitle() {
+  const keepY0 = Y0; Y0 = HUD_H + ROOF_H;   // the title's thief stands on a fixed line
+  R(0, 0, SW, SH, '#0f1530');
+  for (let i = 0; i < 40; i++) R((i * 71) % SW, (i * 37) % 120, 1, 1, '#ffffff88');
+  R(250, 20, 22, 22, '#f5f0c8'); R(256, 20, 16, 16, '#0f1530');
+  // skyline
+  for (let i = 0; i < 12; i++) { const h = 30 + (i * 37) % 50; R(i * 28, 200 - h, 26, h + 40, '#1b2240'); for (let w = 0; w < 6; w++) if ((i + w) % 3) R(i * 28 + 4 + (w % 3) * 7, 205 - h + Math.floor(w / 3) * 10, 3, 4, '#e8d870'); }
+  drawBalloon(60, 120 + Math.sin(time) * 4);
+  drawThief(220, 2, -1, time, 3, false);
+  text('午夜神偷', SW / 2, 22, '#ffd84a', 30, 'center');
+  text('MIDNIGHT HEIST', SW / 2, 58, '#ff7a1a', 12, 'center');
+  // the level list scrolls; locked levels are greyed out
+  const items = titleItems(), ROWS = 8, first = Math.max(0, Math.min(items.length - ROWS, menuSel - (ROWS >> 1)));
+  g.globalAlpha = 0.85; R(56, 76, 208, ROWS * 15 + 4, '#080a18'); g.globalAlpha = 1;
+  for (let r = 0; r < ROWS && first + r < items.length; r++) {
+    const i = first + r, it = items[i], y = 78 + r * 15, on = i === menuSel;
+    let label = '', right = '', col = on ? '#fff' : '#aaa';
+    if (it.kind === 'level') {
+      label = LEVELS[it.i].name;
+      if (it.i > prog.unlocked) { right = '🔒'; col = on ? '#999' : '#555'; }
+      else right = '★'.repeat(prog.stars[it.i]) + '☆'.repeat(3 - prog.stars[it.i]);
+    } else if (it.kind === 'sound') label = `聲音：${soundOn ? '開' : '關'}`;
+    else label = resetArmed ? '重設進度？再撳 OK 確定' : '重設進度';
+    if (on) R(58, y - 2, 204, 14, '#ffffff22');
+    text((on ? '▶ ' : '   ') + label, 64, y, col, 9);
+    if (right) text(right, 256, y + 1, it.i > prog.unlocked ? '#777' : '#ffd84a', 8, 'right');
+  }
+  if (first > 0) text('▲', 270, 76, '#ffd84a', 7);
+  if (first + ROWS < items.length) text('▼', 270, 66 + ROWS * 15, '#ffd84a', 7);
+  const totalStars = prog.stars.reduce((a, b) => a + b, 0);
+  text(`最高分 HI ${String(hiscore).padStart(6, '0')} · ★ ${totalStars}/${LEVELS.length * 3}`, SW / 2, 204, '#ffe066', 8, 'center');
+  text(popupT > 0 ? popupText : 'UP / DOWN 揀 · OK 確定', SW / 2, 216, popupT > 0 ? '#ffd84a' : '#ccc', 8, 'center');
+  text('Original homage prototype · 320×240', SW / 2, 230, '#777', 7, 'center');
+  Y0 = keepY0;
+}
+function drawCenterBox(lines, h = 120) {
+  g.globalAlpha = 0.85; R(30, (SH - h) / 2, SW - 60, h, '#0c0c10'); g.globalAlpha = 1;
+  R(30, (SH - h) / 2, SW - 60, 1, '#ffd84a'); R(30, (SH + h) / 2 - 1, SW - 60, 1, '#ffd84a');
+  let y = (SH - h) / 2 + 8;
+  for (const [s, c, size] of lines) { text(s, SW / 2, y, c || '#fff', size || 8, 'center'); y += (size || 8) + 5; }
+}
+
+function render() {
+  g.setTransform(S, 0, 0, S, 0, 0);
+  if (state === 'title') { drawTitle(); return; }
+  drawWorld(); drawHUD();
+  if (state === 'play') {
+    const h = hint();
+    if (h) { g.globalAlpha = 0.7; R(0, HUD_H + 13, SW, 12, '#000'); g.globalAlpha = 1; text(h, SW / 2, HUD_H + 14, '#fff', 7, 'center'); }
+  } else if (state === 'intro') {
+    const L = lv.L;
+    drawCenterBox(L.bonus
+      ? [['BONUS', '#ffd84a', 16], [L.name, '#fff', 10], [`${L.time} 秒內執晒金磚 · 唔好俾探射燈照到`, '#ddd', 8], ['OK 開始', '#ffd84a', 8]]
+      : [[L.name, '#ffd84a', 16], [`${L.en} · ${L.sub}`, '#bbb', 7], [`偷齊 ${lv.loot.length} 件寶物 · 上天台搭熱氣球走`, '#fff', 8], [`限時 ${Math.floor(L.time / 60)}:${String(L.time % 60).padStart(2, '0')} · 命 ${'♥'.repeat(lives)}`, '#ddd', 8], ['OK 開始', '#ffd84a', 8]], 104);
+  } else if (state === 'pause') {
+    const items = ['繼續 Resume', '重玩 Restart', '返標題 Title'];
+    drawCenterBox([['暫停 PAUSE', '#ffd84a', 12], ...items.map((s, i) => [(i === pauseSel ? '▶ ' : '') + s, i === pauseSel ? '#fff' : '#999', 9])], 90);
+  } else if (state === 'win') {
+    const r = result;
+    const next = levelIdx + 1 < LEVELS.length ? 'OK 下一關 · UP 返標題' : 'OK 返標題 · 全部完成！';
+    if (r.bonus) drawCenterBox([['BONUS 完', '#ffd84a', 14], ['★'.repeat(r.stars) + '☆'.repeat(3 - r.stars), '#ffe066', 12], [r.why, '#fff'], [`金磚 ${r.bars}/${r.of}${r.all ? `  全部 +${C.SCORE_ALLBARS}` : ''}`, '#ffd84a'], [`得分 ${r.total} · 總分 ${totalScore}`, '#ffe066', 9], [next, '#ccc']], 128);
+    else drawCenterBox([['成功走佬！ESCAPED', '#9bd93a', 14], ['★'.repeat(r.stars) + '☆'.repeat(3 - r.stars), '#ffe066', 12],
+      [`寶物 ${r.loot}  時間 +${r.time}`, '#fff'], [r.ghost ? `無俾人發現 +${r.ghost}` : `動作分 ${r.action}`, r.ghost ? '#8fd0ff' : '#ddd'],
+      [`本關 ${r.total} · 總分 ${totalScore}`, '#ffe066', 9], [next, '#ccc']], 140);
+  } else if (state === 'lose') {
+    drawCenterBox([['失手', '#ff5a3a', 16], [loseReason, '#fff', 8], [`仲有 ${'♥'.repeat(lives)}`, '#ff8080', 8], ['OK 再試 · UP 返標題', '#ccc', 8]], 86);
+  } else if (state === 'over') {
+    drawCenterBox([['GAME OVER', '#ff5a3a', 16], [loseReason, '#fff', 8], [`總分 ${totalScore + score} · HI ${hiscore}`, '#ffe066', 8], ['OK 返標題', '#ccc', 8]], 86);
+  }
+}
+
+// --- main loop (fixed 1/30 s step, like the device) --------------------------
+const STEP = 1 / 30;
+let last = performance.now(), acc = 0;
+function frame(now) {
+  acc += Math.min(0.1, (now - last) / 1000); last = now;
+  try {
+    let n = 0;
+    while (acc >= STEP && n < 3) { update(STEP); acc -= STEP; n++; }
+    if (n === 3) acc = 0;
+    render();
+  } catch (e) { console.error(e); throw e; }
+  requestAnimationFrame(frame);
+}
+for (const L of LEVELS) build(L);   // validate every level map at load
+menuSel = prog.unlocked;
+requestAnimationFrame(frame);
+// Hooks for automated smoke tests.
+window.__hb = { get state() { return state; }, get p() { return p; }, get lv() { return lv; }, get lives() { return lives; },
+  get score() { return score; }, get total() { return totalScore; }, get result() { return result; }, get timeLeft() { return timeLeft; },
+  set timeLeft(v) { timeLeft = v; }, setKey, startLevel, update, render, setState, C, LEVELS,
+  get prog() { return prog; }, loadProgress, get menuSel() { return menuSel; }, set menuSel(v) { menuSel = v; }, get Y0() { return Y0; },
+  get resetArmed() { return resetArmed; }, get popupT() { return popupT; }, get levelIdx() { return levelIdx; }, titleItems, toTitle };
+</script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+# The AI Passport assistant's partition table (ai-passport-muse:
+# esp32/partitions_muse_8mb.csv), byte for byte the same layout. The game is
+# built against it so it can live in ota_1 next to the assistant in ota_0.
+# Never flash this table by itself: tools/flash.sh writes only the app.
+# Name,    Type, SubType, Offset,   Size,    Flags
+nvs,       data, nvs,     0x11000,  0xC000,
+otadata,   data, ota,     0x1D000,  0x2000,
+phy_init,  data, phy,     0x1F000,  0x1000,
+ota_0,     app,  ota_0,   0x20000,  0x3E0000,
+ota_1,     app,  ota_1,   0x400000, 0x3E0000,
+prod_data, data, 0x40,    0x7E0000, 0x1000,
+prod_bak,  data, 0x41,    0x7E1000, 0x1000,

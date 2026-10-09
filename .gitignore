@@ -1,0 +1,13 @@
+# ESP-IDF build output and generated config
+build/
+sdkconfig*
+!sdkconfig.defaults
+managed_components/
+dependencies.lock
+
+# Signing keys never go in the repo (copy dev_signing_key.pem from ai-passport-muse/esp32/)
+*.pem
+
+.DS_Store
+__pycache__/
+*.pyc
